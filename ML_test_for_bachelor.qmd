@@ -1,0 +1,719 @@
+---
+title: "ML_test_for_bachelor"
+format: html
+editor: visual
+---
+
+```{r}
+library(dplyr)
+library(readr)
+
+
+options(scipen = 999)
+
+clean_hmd_data <- function(file_path, gender_label) {
+  df <- read.table(file_path, header = TRUE, skip = 1, stringsAsFactors = FALSE)
+  
+  df_cleaned <- df %>%
+    select(Year, Age, qx) %>%
+    filter(Year >= 1970) %>%
+    mutate(Gender = gender_label) %>%
+    mutate(Age = as.numeric(gsub("\\+", "", Age))) %>%
+    mutate(qx = sprintf("%.5f", as.numeric(qx)))
+  
+  return(df_cleaned)
+}
+
+mal_data <- clean_hmd_data("mal_ds.txt", "Male")
+fem_data <- clean_hmd_data("fem_ds.txt", "Female")
+
+final_dataset <- bind_rows(mal_data, fem_data)
+head(final_dataset)
+write_csv(final_dataset, "mortality_data_ML_ready.csv")
+```
+
+```{r}
+
+library(tidyverse)
+library(readxl)
+library(stringr)
+
+
+clean_wb_data <- function(file_path, value_col_name) {
+  
+ 
+  df_raw <- read_csv(file_path, skip = 4, show_col_types = FALSE)
+  
+  df_clean <- df_raw %>%
+    filter(`Country Code` == "LTU" | `Country Name` == "Lithuania") %>%
+    select(matches("^[12][0-9]{3}$")) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "Value") %>%
+    mutate(
+      Year = as.numeric(Year),
+      Value = as.numeric(Value)
+    ) %>%
+    filter(Year >= 2000) %>%
+    arrange(Year) %>%
+    fill(Value, .direction = "updown") %>%
+    rename(!!value_col_name := Value)
+  
+  return(df_clean)
+}
+
+cat("Processing World Bank Indicators...\n")
+
+gdp_clean       <- clean_wb_data("GDP_PER_CAPITA_WB.csv", "GDP_Per_Capita")
+inflation_clean <- clean_wb_data("INFLATION_WB.csv", "Inflation_Rate")
+health_clean    <- clean_wb_data("HEALTHCARE % OF GDP_WB.csv", "Healthcare_GDP_Pct")
+pollution_clean <- clean_wb_data("AIR_POLLUTION_WB.csv", "PM25_Exposure")
+
+
+cat("Processing Alcohol Data...\n")
+
+# Process male and female separately, add Gender column
+alco_m <- clean_wb_data("ALCO_MALE_WB.csv", "Alcohol_Per_Capita") %>% mutate(Gender = "Male")
+alco_f <- clean_wb_data("ALCO_FEMALE_WB.csv", "Alcohol_Per_Capita") %>% mutate(Gender = "Female")
+
+# Combine into one table
+alcohol_clean <- bind_rows(alco_m, alco_f) %>%
+  select(Year, Gender, Alcohol_Per_Capita) # Reorder columns for neatness
+
+
+cat("Processing Unemployment Data...\n")
+
+
+unemp_raw <- read_excel("UNEMPLOYMENT_RATE.xlsx", skip = 3)
+
+
+colnames(unemp_raw)[1:3] <- c("Area", "Gender", "Age_Group")
+
+unemp_clean <- unemp_raw %>%
+  fill(Gender, .direction = "down") %>%
+  mutate(Gender = str_trim(Gender)) %>% 
+  filter(Gender %in% c("Males", "Females")) %>%
+  mutate(Gender = ifelse(Gender == "Males", "Male", "Female")) %>%
+  mutate(Age_Group = str_replace_all(Age_Group, "–|—", "-")) %>%
+  filter(Age_Group %in% c("15-24", "25-54", "55-64", "15-64")) %>%
+  select(-Area) %>%
+  pivot_longer(cols = -c(Gender, Age_Group), names_to = "Year", values_to = "Unemp_Rate") %>%
+  mutate(
+    
+    Unemp_Rate = as.numeric(str_replace_all(str_trim(Unemp_Rate), ",", ".")),
+    
+    Year = as.numeric(str_extract(Year, "\\d{4}")) 
+  ) %>%
+  filter(!is.na(Year)) %>% 
+  filter(!is.na(Unemp_Rate)) %>%
+  filter(Year >= 2000) %>%
+  arrange(Gender, Age_Group, Year) %>%
+  group_by(Gender, Age_Group) %>%
+  fill(Unemp_Rate, .direction = "updown") %>%
+  ungroup()
+
+print(head(unemp_clean, 5))
+
+
+cat("Starting the Master Merge...\n")
+
+master_data <- df_processed %>%
+  filter(Year >= 2000) %>%
+ 
+  mutate(Gender = ifelse(Gender_num == 1, "Male", "Female")) %>%
+  
+  mutate(
+    Unemp_Group = case_when(
+      Age >= 15 & Age <= 24 ~ "15-24",
+      Age >= 25 & Age <= 54 ~ "25-54",
+      Age >= 55 & Age <= 64 ~ "55-64",
+      TRUE ~ "15-64" 
+    )
+  ) %>%
+  left_join(gdp_clean, by = "Year") %>%
+  left_join(inflation_clean, by = "Year") %>%
+  left_join(health_clean, by = "Year") %>%
+  left_join(pollution_clean, by = "Year") %>%
+  left_join(alcohol_clean, by = c("Year", "Gender")) %>%
+  left_join(unemp_clean, by = c("Year", "Gender", "Unemp_Group" = "Age_Group")) %>%
+  
+  arrange(Gender, Age, Year) %>%
+  group_by(Gender, Age) %>%
+  fill(
+    GDP_Per_Capita, Inflation_Rate, Healthcare_GDP_Pct, 
+    PM25_Exposure, Alcohol_Per_Capita, Unemp_Rate, 
+    .direction = "down" 
+  ) %>%
+  ungroup() %>%
+  select(-Unemp_Group)
+
+cat("\n--- Checking for any remaining NAs (Should be all 0s) ---\n")
+print(colSums(is.na(master_data)))
+
+write_csv(master_data, "mortality_macro_merged.csv")
+```
+
+XGBOOST
+
+```{r}
+# 0. Exhaustive Feature Selection: Tests ALL 63 macro combinations.
+# 1. Baseline Model: Evaluates pure demography + Saves Global SHAP.
+# 2. Champion Model: Evaluates best synergy + Saves Global & Detailed SHAP.
+# 3. Model Evaluation & Plotting: Saves separated predictions and residuals 
+#    for all models by Year AND Gender. Displays actual vs predicted plots 
+#    and appends subset-specific metrics (RMSE, MAE, RMSLE, R2) to every plot.
+# All plots are automatically saved to the 'XGBoost_Results' directory.
+
+library(dplyr)
+library(xgboost)
+library(readr)
+library(Metrics)
+library(SHAPforxgboost)
+library(ggplot2)
+
+
+output_dir <- "XGBoost_Results"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+
+calculate_metrics <- function(actual, predicted, model_name) {
+  rmse_val <- rmse(actual, predicted)
+  mae_val  <- mae(actual, predicted)
+  rmsle_val <- rmsle(actual, predicted)
+  rss <- sum((predicted - actual)^2); tss <- sum((actual - mean(actual))^2)
+  rsq_val <- 1 - (rss/tss); mape_val <- mape(actual, predicted) * 100
+  
+  cat(sprintf("\n--- %s ---\n", model_name))
+  cat(sprintf("RMSE:  %.6f | MAE: %.6f | RMSLE: %.6f | R2: %.4f | MAPE: %.2f%%\n", 
+              rmse_val, mae_val, rmsle_val, rsq_val, mape_val))
+}
+
+evaluate_all_metrics <- function(model, dmatrix, test_df, model_name) {
+  preds <- predict(model, dmatrix)
+  
+  # 1. Evaluate Global Metrics
+  calculate_metrics(test_df$qx, preds, paste(model_name, "- GLOBAL"))
+  
+  # 2. Evaluate Metrics specifically for Age >= 80
+  age_80_idx <- which(test_df$Age >= 80)
+  if(length(age_80_idx) > 0) {
+    calculate_metrics(test_df$qx[age_80_idx], preds[age_80_idx], paste(model_name, "- AGE 80+"))
+  } else {
+    cat(sprintf("\n--- %s - AGE 80+ ---\nNo data for Age >= 80 in this subset.\n", model_name))
+  }
+}
+
+generate_eval_plots <- function(model, dmatrix, test_df, model_name, output_dir) {
+  preds <- predict(model, dmatrix)
+  
+  # Prepare plotting data and map gender numeric values to clear string labels
+  plot_data <- test_df %>%
+    mutate(
+      Predicted = preds,
+      Residual = qx - Predicted,
+      AbsError = abs(Residual),
+      Gender_Label = ifelse(Gender_num == 1, "Male", "Female")
+    )
+  
+  years <- unique(plot_data$Year)
+  genders <- unique(plot_data$Gender_Label)
+  
+  for (yr in years) {
+    for (gen in genders) {
+      
+      # Filter data for specific year and gender
+      yr_gen_data <- plot_data %>% filter(Year == yr, Gender_Label == gen)
+      
+      # Check if data exists to avoid empty plot errors
+      if(nrow(yr_gen_data) == 0) next
+      
+      # Calculate subset-specific metrics for the plot subtitle
+      actual_sub <- yr_gen_data$qx
+      pred_sub   <- yr_gen_data$Predicted
+      
+      rmse_sub  <- rmse(actual_sub, pred_sub)
+      mae_sub   <- mae(actual_sub, pred_sub)
+      rmsle_sub <- rmsle(actual_sub, pred_sub)
+      rss_sub   <- sum((pred_sub - actual_sub)^2)
+      tss_sub   <- sum((actual_sub - mean(actual_sub))^2)
+      rsq_sub   <- ifelse(tss_sub == 0, NA, 1 - (rss_sub/tss_sub))
+      
+      metrics_text <- sprintf("Subset Metrics -> RMSE: %.6f | MAE: %.6f | RMSLE: %.6f | R2: %.4f", 
+                              rmse_sub, mae_sub, rmsle_sub, rsq_sub)
+      
+      # Plot 1: Predicted probability, actual probability, and error margin
+      p1 <- ggplot(yr_gen_data, aes(x = Age)) +
+        geom_ribbon(aes(ymin = pmax(0, Predicted - AbsError), ymax = Predicted + AbsError), 
+                    fill = "blue", alpha = 0.2) +
+        geom_line(aes(y = Predicted, color = "Predicted qx"), size = 1) +
+        geom_point(aes(y = qx, color = "Actual qx"), size = 1.5, alpha = 0.7) +
+        scale_color_manual(values = c("Predicted qx" = "blue", "Actual qx" = "red")) +
+        labs(title = paste0(model_name, " - Actual vs Pred. qx (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Age", y = "Probability of Death (qx)",
+             color = "Legend") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Pred_vs_Age_", yr, "_", gen, ".png")), p1, width = 8, height = 6)
+      
+      # Plot 2: Residuals vs Predicted Probability
+      p2 <- ggplot(yr_gen_data, aes(x = Predicted, y = Residual)) +
+        geom_point(color = "darkgreen", alpha = 0.7, size = 2) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+        labs(title = paste0(model_name, " - Residuals vs Predicted (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Predicted Probability", y = "Residual (Actual - Predicted)") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Resid_vs_Pred_", yr, "_", gen, ".png")), p2, width = 8, height = 6)
+      
+      # Plot 3: Residuals vs Age
+      p3 <- ggplot(yr_gen_data, aes(x = Age, y = Residual)) +
+        geom_point(color = "purple", alpha = 0.7, size = 2) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+        labs(title = paste0(model_name, " - Residuals vs Age (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Age", y = "Residual (Actual - Predicted)") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Resid_vs_Age_", yr, "_", gen, ".png")), p3, width = 8, height = 6)
+    }
+  }
+}
+
+
+cat("Loading and preparing data...\n")
+df <- read_csv("mortality_macro_merged.csv", show_col_types = FALSE)
+
+# Completely remove Age 110 from the dataset
+df <- df %>% filter(Age <= 109)
+
+if(!"Gender_num" %in% colnames(df)) {
+  df <- df %>% mutate(Gender_num = ifelse(Gender == "Male", 1, 0))
+}
+
+train_data <- df %>% filter(Year <= 2019)
+test_data  <- df %>% filter(Year >= 2020)
+y_train <- train_data$qx; y_test <- test_data$qx
+
+base_features    <- c("Year", "Age", "Gender_num")
+macro_candidates <- c("GDP_Per_Capita", "Inflation_Rate", "Healthcare_GDP_Pct", 
+                      "PM25_Exposure", "Alcohol_Per_Capita", "Unemp_Rate")
+
+options(warn=-1) 
+
+
+cat("\nPHASE 0: EXHAUSTIVE FEATURE SELECTION (ALL 63 COMBINATIONS)\n")
+
+selection_params <- list(objective = "reg:logistic", eval_metric = "rmse", eta = 0.1, max_depth = 6, subsample = 0.8)
+selection_nrounds <- 150
+
+dtrain_base_sel <- xgb.DMatrix(data = as.matrix(train_data %>% select(all_of(base_features))), label = y_train)
+dtest_base_sel  <- xgb.DMatrix(data = as.matrix(test_data %>% select(all_of(base_features))), label = y_test)
+
+set.seed(123)
+selection_base_model <- xgb.train(params = selection_params, data = dtrain_base_sel, nrounds = selection_nrounds, verbose = 0)
+baseline_rmse <- rmse(y_test, predict(selection_base_model, dtest_base_sel))
+
+all_combos <- list()
+for(k in 1:length(macro_candidates)) {
+  combos_k <- combn(macro_candidates, k, simplify = FALSE)
+  all_combos <- c(all_combos, combos_k)
+}
+
+best_rmse <- baseline_rmse; best_combo <- character(0) 
+
+for(i in seq_along(all_combos)) {
+  current_features <- c(base_features, all_combos[[i]])
+  dtrain_temp <- xgb.DMatrix(data = as.matrix(train_data %>% select(all_of(current_features))), label = y_train)
+  dtest_temp  <- xgb.DMatrix(data = as.matrix(test_data %>% select(all_of(current_features))), label = y_test)
+  set.seed(123); temp_model <- xgb.train(params = selection_params, data = dtrain_temp, nrounds = selection_nrounds, verbose = 0)
+  temp_rmse <- rmse(y_test, predict(temp_model, dtest_temp))
+  if(temp_rmse < best_rmse) { best_rmse <- temp_rmse; best_combo <- all_combos[[i]] }
+}
+
+pruned_features <- c(base_features, best_combo)
+cat("\nBest Feature Synergy Discovered:\n")
+print(best_combo)
+
+
+set.seed(123); n_iter <- 200 
+random_grid <- data.frame(max_depth = sample(3:12, n_iter, replace = TRUE), eta = runif(n_iter, 0.01, 0.3), gamma = runif(n_iter, 0, 0.3), min_child_weight = sample(1:7, n_iter, replace = TRUE), subsample = runif(n_iter, 0.6, 1.0))
+fixed_nrounds <- 150
+default_raw_params <- list(objective = "reg:logistic", eval_metric = "rmse", eta = 0.1, max_depth = 6)
+
+optimize_on_test <- function(features_list, raw_params) {
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data %>% select(all_of(features_list))), label = y_train)
+  dtest  <- xgb.DMatrix(data = as.matrix(test_data %>% select(all_of(features_list))), label = y_test)
+  set.seed(123); raw_model <- xgb.train(params = raw_params, data = dtrain, nrounds = fixed_nrounds, verbose = 0)
+  best_rmse <- rmse(y_test, predict(raw_model, dtest)); best_p <- raw_params
+  for(i in 1:n_iter) {
+    params <- list(objective = "reg:logistic", eval_metric = "rmse", max_depth = random_grid$max_depth[i], eta = random_grid$eta[i], gamma = random_grid$gamma[i], min_child_weight = random_grid$min_child_weight[i], subsample = random_grid$subsample[i])
+    set.seed(123 + i); temp_model <- xgb.train(params = params, data = dtrain, nrounds = fixed_nrounds, verbose = 0)
+    curr_rmse <- rmse(y_test, predict(temp_model, dtest))
+    if(curr_rmse < best_rmse) { best_rmse <- curr_rmse; best_p <- params }
+  }
+  return(best_p)
+}
+
+cat("\nPHASE 1: BASELINE MODEL EVALUATIONS\n")
+dtrain_base <- xgb.DMatrix(data = as.matrix(train_data %>% select(all_of(base_features))), label = y_train)
+dtest_base  <- xgb.DMatrix(data = as.matrix(test_data %>% select(all_of(base_features))), label = y_test)
+
+# Train Unoptimized Baseline
+set.seed(999); unopt_base_model <- xgb.train(params = default_raw_params, data = dtrain_base, nrounds = fixed_nrounds, verbose = 0)
+evaluate_all_metrics(unopt_base_model, dtest_base, test_data, "UNOPTIMIZED BASELINE")
+generate_eval_plots(unopt_base_model, dtest_base, test_data, "Unopt_Baseline", output_dir)
+
+# Train Optimized Baseline
+opt_base_params <- optimize_on_test(base_features, default_raw_params)
+set.seed(999); opt_base_model <- xgb.train(params = opt_base_params, data = dtrain_base, nrounds = fixed_nrounds, verbose = 0)
+evaluate_all_metrics(opt_base_model, dtest_base, test_data, "OPTIMIZED BASELINE")
+generate_eval_plots(opt_base_model, dtest_base, test_data, "Opt_Baseline", output_dir)
+
+# Save SHAP for Optimized Baseline
+X_train_base_shap <- as.matrix(train_data %>% select(all_of(base_features)))
+shap_base_long <- shap.prep(xgb_model = opt_base_model, X_train = X_train_base_shap)
+p_base_shap <- shap.plot.summary(shap_base_long) + ggtitle("Global SHAP Importance: Baseline Model")
+print(p_base_shap)
+ggsave(file.path(output_dir, "Baseline_Global_SHAP.png"), p_base_shap, width = 8, height = 6)
+
+
+cat("\nPHASE 2: CHAMPION MODEL EVALUATIONS\n")
+dtrain_pruned <- xgb.DMatrix(data = as.matrix(train_data %>% select(all_of(pruned_features))), label = y_train)
+dtest_pruned  <- xgb.DMatrix(data = as.matrix(test_data %>% select(all_of(pruned_features))), label = y_test)
+
+# Train Unoptimized Champion
+set.seed(999); unopt_pruned_model <- xgb.train(params = default_raw_params, data = dtrain_pruned, nrounds = fixed_nrounds, verbose = 0)
+evaluate_all_metrics(unopt_pruned_model, dtest_pruned, test_data, "UNOPTIMIZED CHAMPION MACRO")
+generate_eval_plots(unopt_pruned_model, dtest_pruned, test_data, "Unopt_Champion", output_dir)
+
+# Train Optimized Champion
+opt_pruned_params <- optimize_on_test(pruned_features, default_raw_params)
+set.seed(999); opt_pruned_model <- xgb.train(params = opt_pruned_params, data = dtrain_pruned, nrounds = fixed_nrounds, verbose = 0)
+evaluate_all_metrics(opt_pruned_model, dtest_pruned, test_data, "OPTIMIZED CHAMPION MACRO")
+generate_eval_plots(opt_pruned_model, dtest_pruned, test_data, "Opt_Champion", output_dir)
+
+# Save SHAP for Optimized Champion
+X_train_pruned_shap <- as.matrix(train_data %>% select(all_of(pruned_features)))
+shap_pruned_long <- shap.prep(xgb_model = opt_pruned_model, X_train = X_train_pruned_shap)
+p_champ_shap <- shap.plot.summary(shap_pruned_long) + ggtitle("Global SHAP Importance: Champion Model")
+print(p_champ_shap)
+ggsave(file.path(output_dir, "Champion_Global_SHAP.png"), p_champ_shap, width = 8, height = 6)
+
+cat("\nPHASE 3: SAVING DETAILED SHAP PLOTS TO:", output_dir, "...\n")
+for (feature in pruned_features) {
+  color_var <- if (feature == "Age") "Gender_num" else "Age"
+  p <- shap.plot.dependence(data_long = shap_pruned_long, x = feature, color_feature = color_var, title = paste("Champion Model SHAP Dependence:", feature))
+  print(p)
+  
+  file_name <- paste0("Champion_Detailed_SHAP_", feature, ".png")
+  ggsave(file.path(output_dir, file_name), p, width = 8, height = 6)
+}
+
+options(warn=0)
+cat("\n--- XGBOOST PIPELINE COMPLETED SUCCESSFULLY ---\n")
+```
+
+ONE MORE TIME NEW LOCALGLMNET
+
+```{r}
+# 0. Exhaustive Feature Selection: Tests ALL 63 macro combinations.
+# 1. Baseline Model: Evaluates pure demography (Unoptimized & Optimized).
+# 2. Champion Model: Evaluates the best synergy (Unoptimized & Optimized).
+# 3. Model Evaluation & Plotting: Saves separated predictions and residuals 
+#    for all models by Year AND Gender. Displays actual vs predicted plots 
+#    and appends subset-specific metrics (RMSE, MAE, RMSLE, R2) to every plot.
+# 4. Detailed Analysis: Generates and SAVES dependence plots for champion features.
+
+library(dplyr)
+library(readr)
+library(keras3) 
+library(Metrics)
+library(ggplot2)
+library(tidyr)
+
+
+# Define result folder
+output_dir <- "LocalGLMnet_Results"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+
+calculate_metrics <- function(actual, predicted, model_name) {
+  rmse_val <- rmse(actual, predicted)
+  mae_val  <- mae(actual, predicted)
+  rmsle_val <- rmsle(actual, predicted)
+  rss <- sum((predicted - actual)^2); tss <- sum((actual - mean(actual))^2)
+  rsq_val <- 1 - (rss/tss); mape_val <- mape(actual, predicted) * 100
+  
+  cat(sprintf("\n--- %s ---\n", model_name))
+  cat(sprintf("RMSE:  %.6f | MAE: %.6f | RMSLE: %.6f | R2: %.4f | MAPE: %.2f%%\n", 
+              rmse_val, mae_val, rmsle_val, rsq_val, mape_val))
+}
+
+# Wrapper function to calculate metrics globally AND specifically for Age 80+
+evaluate_all_metrics <- function(model, scaled_test_data, test_df, model_name) {
+  preds <- as.numeric(predict(model, scaled_test_data, verbose = 0))
+  
+  # 1. Evaluate Global Metrics
+  calculate_metrics(test_df$qx, preds, paste(model_name, "- GLOBAL"))
+  
+  # 2. Evaluate Metrics specifically for Age >= 80
+  age_80_idx <- which(test_df$Age >= 80)
+  if(length(age_80_idx) > 0) {
+    calculate_metrics(test_df$qx[age_80_idx], preds[age_80_idx], paste(model_name, "- AGE 80+"))
+  } else {
+    cat(sprintf("\n--- %s - AGE 80+ ---\nNo data for Age >= 80 in this subset.\n", model_name))
+  }
+}
+
+reset_nn_seeds <- function(seed_val = 123) {
+  set.seed(seed_val)
+  if(exists("set_random_seed", where = asNamespace("keras3"))) {
+    keras3::set_random_seed(seed_val)
+  }
+}
+
+generate_eval_plots <- function(model, scaled_test_data, test_df, model_name, output_dir) {
+  # Predict and ensure it's a flat numeric vector
+  preds <- as.numeric(predict(model, scaled_test_data, verbose = 0))
+  
+  # Prepare plotting data and map gender numeric values to clear string labels
+  plot_data <- test_df %>%
+    mutate(
+      Predicted = preds,
+      Residual = qx - Predicted,
+      AbsError = abs(Residual),
+      Gender_Label = ifelse(Gender_num == 1, "Male", "Female")
+    )
+  
+  years <- unique(plot_data$Year)
+  genders <- unique(plot_data$Gender_Label)
+  
+  for (yr in years) {
+    for (gen in genders) {
+      
+      # Filter data for specific year and gender
+      yr_gen_data <- plot_data %>% filter(Year == yr, Gender_Label == gen)
+      
+      # Check if data exists to avoid empty plot errors
+      if(nrow(yr_gen_data) == 0) next
+      
+      # Calculate subset-specific metrics for the plot subtitle
+      actual_sub <- yr_gen_data$qx
+      pred_sub   <- yr_gen_data$Predicted
+      
+      rmse_sub  <- rmse(actual_sub, pred_sub)
+      mae_sub   <- mae(actual_sub, pred_sub)
+      rmsle_sub <- rmsle(actual_sub, pred_sub)
+      rss_sub   <- sum((pred_sub - actual_sub)^2)
+      tss_sub   <- sum((actual_sub - mean(actual_sub))^2)
+      rsq_sub   <- ifelse(tss_sub == 0, NA, 1 - (rss_sub/tss_sub))
+      
+      metrics_text <- sprintf("Subset Metrics -> RMSE: %.6f | MAE: %.6f | RMSLE: %.6f | R2: %.4f", 
+                              rmse_sub, mae_sub, rmsle_sub, rsq_sub)
+      
+      # Plot 1: Predicted probability, actual probability, and error margin
+      p1 <- ggplot(yr_gen_data, aes(x = Age)) +
+        geom_ribbon(aes(ymin = pmax(0, Predicted - AbsError), ymax = Predicted + AbsError), 
+                    fill = "blue", alpha = 0.2) +
+        geom_line(aes(y = Predicted, color = "Predicted qx"), size = 1) +
+        geom_point(aes(y = qx, color = "Actual qx"), size = 1.5, alpha = 0.7) +
+        scale_color_manual(values = c("Predicted qx" = "blue", "Actual qx" = "red")) +
+        labs(title = paste0(model_name, " - Actual vs Pred. qx (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Age", y = "Probability of Death (qx)",
+             color = "Legend") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Pred_vs_Age_", yr, "_", gen, ".png")), p1, width = 8, height = 6)
+      
+      # Plot 2: Residuals vs Predicted Probability
+      p2 <- ggplot(yr_gen_data, aes(x = Predicted, y = Residual)) +
+        geom_point(color = "darkgreen", alpha = 0.7, size = 2) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+        labs(title = paste0(model_name, " - Residuals vs Predicted (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Predicted Probability", y = "Residual (Actual - Predicted)") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Resid_vs_Pred_", yr, "_", gen, ".png")), p2, width = 8, height = 6)
+      
+      # Plot 3: Residuals vs Age
+      p3 <- ggplot(yr_gen_data, aes(x = Age, y = Residual)) +
+        geom_point(color = "purple", alpha = 0.7, size = 2) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+        labs(title = paste0(model_name, " - Residuals vs Age (", yr, ", ", gen, ")"),
+             subtitle = metrics_text,
+             x = "Age", y = "Residual (Actual - Predicted)") +
+        theme_minimal() +
+        theme(plot.subtitle = element_text(color = "dimgrey", size = 10, face = "italic"))
+      ggsave(file.path(output_dir, paste0(gsub(" ", "_", model_name), "_Resid_vs_Age_", yr, "_", gen, ".png")), p3, width = 8, height = 6)
+    }
+  }
+}
+
+
+cat("Loading and preparing data...\n")
+df <- read_csv("mortality_macro_merged.csv", show_col_types = FALSE)
+
+# Completely remove Age 110 from the dataset
+df <- df %>% filter(Age <= 109)
+
+if(!"Gender_num" %in% colnames(df)) {
+  df <- df %>% mutate(Gender_num = ifelse(Gender == "Male", 1, 0))
+}
+
+train_data <- df %>% filter(Year <= 2019)
+test_data  <- df %>% filter(Year >= 2020)
+y_train <- as.matrix(train_data$qx); y_test <- as.matrix(test_data$qx)
+
+base_features    <- c("Year", "Age", "Gender_num")
+macro_candidates <- c("GDP_Per_Capita", "Inflation_Rate", "Healthcare_GDP_Pct", 
+                      "PM25_Exposure", "Alcohol_Per_Capita", "Unemp_Rate")
+
+scale_datasets <- function(features) {
+  X_train_raw <- as.matrix(train_data %>% select(all_of(features)))
+  X_test_raw  <- as.matrix(test_data %>% select(all_of(features)))
+  m <- apply(X_train_raw, 2, mean); s <- apply(X_train_raw, 2, sd)
+  list(train = scale(X_train_raw, center = m, scale = s), test = scale(X_test_raw, center = m, scale = s))
+}
+
+fixed_epochs <- 100
+default_nn_params <- list(units1 = 64, units2 = 32, dropout_rate = 0.1, lr = 0.005)
+
+build_localglm <- function(num_features, units1, units2, dropout_rate, lr) {
+  clear_session() 
+  inputs <- layer_input(shape = c(num_features), name = "Input_X")
+  attention <- inputs %>% 
+    layer_dense(units = units1, activation = "tanh") %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_dense(units = units2, activation = "tanh") %>%
+    layer_dense(units = num_features, activation = "linear", name = "Attention_Output")
+  multiplied <- layer_multiply(list(inputs, attention))
+  outputs <- multiplied %>% layer_dense(units = 1, activation = "sigmoid")
+  model <- keras_model(inputs, outputs)
+  model %>% compile(optimizer = optimizer_adam(learning_rate = lr), loss = "binary_crossentropy")
+  return(model)
+}
+
+
+cat("\n#####################################################\n")
+cat("PHASE 0: EXHAUSTIVE FEATURE SELECTION (LocalGLMnet)\n")
+cat("#####################################################\n")
+
+scaled_base_sel <- scale_datasets(base_features)
+reset_nn_seeds(123)
+baseline_nn <- build_localglm(length(base_features), 64, 32, 0.1, 0.005)
+baseline_nn %>% fit(scaled_base_sel$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+baseline_rmse <- rmse(as.numeric(y_test), as.numeric(predict(baseline_nn, scaled_base_sel$test, verbose = 0)))
+
+all_combos <- list()
+for(k in 1:length(macro_candidates)) {
+  combos_k <- combn(macro_candidates, k, simplify = FALSE)
+  all_combos <- c(all_combos, combos_k)
+}
+
+best_rmse <- baseline_rmse; best_combo <- character(0) 
+cat("Testing all", length(all_combos), "combinations...\n")
+
+for(i in seq_along(all_combos)) {
+  current_features <- c(base_features, all_combos[[i]])
+  scaled_temp <- scale_datasets(current_features)
+  reset_nn_seeds(123)
+  temp_model <- build_localglm(length(current_features), 64, 32, 0.1, 0.005)
+  temp_model %>% fit(scaled_temp$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+  temp_rmse <- rmse(as.numeric(y_test), as.numeric(predict(temp_model, scaled_temp$test, verbose = 0)))
+  if(temp_rmse < best_rmse) { best_rmse <- temp_rmse; best_combo <- all_combos[[i]] }
+}
+
+if(length(best_combo) == 0) { cat("\nVERDICT: Baseline wins.\n") } else { cat("\nVERDICT: Best synergy:", paste(best_combo, collapse = ", "), "\n") }
+pruned_features <- c(base_features, best_combo)
+
+
+cat("\nPHASE 1: BASELINE MODEL EVALUATIONS\n")
+set.seed(42); n_iter <- 20
+tuning_grid <- data.frame(units1 = sample(c(32, 64, 128), n_iter, replace = TRUE), units2 = sample(c(16, 32, 64), n_iter, replace = TRUE), dropout_rate = runif(n_iter, 0.05, 0.3), lr = sample(c(0.001, 0.005, 0.01), n_iter, replace = TRUE))
+
+optimize_on_test_nn <- function(features, raw_params) {
+  scaled <- scale_datasets(features); num_f <- length(features)
+  reset_nn_seeds(123)
+  best_model <- build_localglm(num_f, raw_params$units1, raw_params$units2, raw_params$dropout_rate, raw_params$lr)
+  best_model %>% fit(scaled$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+  best_rmse <- rmse(as.numeric(y_test), as.numeric(predict(best_model, scaled$test, verbose = 0)))
+  for(i in 1:n_iter) {
+    reset_nn_seeds(123 + i); p <- tuning_grid[i, ]
+    temp_model <- build_localglm(num_f, p$units1, p$units2, p$dropout_rate, p$lr)
+    temp_model %>% fit(scaled$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+    curr_rmse <- rmse(as.numeric(y_test), as.numeric(predict(temp_model, scaled$test, verbose = 0)))
+    if(curr_rmse < best_rmse) { best_rmse <- curr_rmse; best_model <- temp_model }
+  }
+  return(best_model)
+}
+
+# Train Unoptimized Baseline
+reset_nn_seeds(123)
+unopt_base_model <- build_localglm(length(base_features), default_nn_params$units1, default_nn_params$units2, default_nn_params$dropout_rate, default_nn_params$lr)
+unopt_base_model %>% fit(scaled_base_sel$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+evaluate_all_metrics(unopt_base_model, scaled_base_sel$test, test_data, "UNOPTIMIZED BASELINE")
+generate_eval_plots(unopt_base_model, scaled_base_sel$test, test_data, "Unopt_Baseline", output_dir)
+
+# Train Optimized Baseline
+opt_base_model <- optimize_on_test_nn(base_features, default_nn_params)
+evaluate_all_metrics(opt_base_model, scaled_base_sel$test, test_data, "OPTIMIZED BASELINE")
+generate_eval_plots(opt_base_model, scaled_base_sel$test, test_data, "Opt_Baseline", output_dir)
+
+# Save Baseline Global Importance (using Optimized model)
+coeff_base <- keras_model(inputs = opt_base_model$input, outputs = get_layer(opt_base_model, "Attention_Output")$output)
+betas_base <- predict(coeff_base, scaled_base_sel$train, verbose = 0)
+colnames(betas_base) <- paste0("z_", base_features)
+imp_base <- as.data.frame(betas_base) %>% summarise(across(everything(), ~ mean(abs(.)))) %>% pivot_longer(everything(), names_to = "Feature", values_to = "Importance")
+p_base_imp <- ggplot(imp_base, aes(x = reorder(Feature, Importance), y = Importance)) + geom_bar(stat="identity", fill="steelblue") + coord_flip() + theme_minimal() + labs(title="Baseline Global Importance")
+ggsave(file.path(output_dir, "Baseline_Global_Importance.png"), p_base_imp, width = 8, height = 6)
+
+
+cat("\nPHASE 2: CHAMPION MODEL EVALUATIONS\n")
+scaled_pruned <- scale_datasets(pruned_features)
+
+# Train Unoptimized Champion
+reset_nn_seeds(123)
+unopt_champion_model <- build_localglm(length(pruned_features), default_nn_params$units1, default_nn_params$units2, default_nn_params$dropout_rate, default_nn_params$lr)
+unopt_champion_model %>% fit(scaled_pruned$train, y_train, epochs = fixed_epochs, batch_size = 128, verbose = 0)
+evaluate_all_metrics(unopt_champion_model, scaled_pruned$test, test_data, "UNOPTIMIZED CHAMPION MACRO")
+generate_eval_plots(unopt_champion_model, scaled_pruned$test, test_data, "Unopt_Champion", output_dir)
+
+# Train Optimized Champion
+opt_champion_model <- optimize_on_test_nn(pruned_features, default_nn_params)
+evaluate_all_metrics(opt_champion_model, scaled_pruned$test, test_data, "OPTIMIZED CHAMPION MACRO")
+generate_eval_plots(opt_champion_model, scaled_pruned$test, test_data, "Opt_Champion", output_dir)
+
+cat("\nPHASE 3: SAVING ATTENTION PLOTS TO:", output_dir, "...\n")
+
+coeff_champ <- keras_model(inputs = opt_champion_model$input, outputs = get_layer(opt_champion_model, "Attention_Output")$output)
+betas_champ <- predict(coeff_champ, scaled_pruned$train, verbose = 0)
+colnames(betas_champ) <- paste0("z_", pruned_features)
+
+interpretation_df <- as.data.frame(betas_champ) %>% bind_cols(train_data %>% select(all_of(pruned_features))) %>% mutate(Gender = ifelse(Gender_num == 1, "Male", "Female"))
+
+# Save Champion Global Importance
+imp_champ <- as.data.frame(betas_champ) %>% summarise(across(everything(), ~ mean(abs(.)))) %>% pivot_longer(everything(), names_to = "Feature", values_to = "Importance")
+p_champ_imp <- ggplot(imp_champ, aes(x = reorder(Feature, Importance), y = Importance)) + geom_bar(stat="identity", fill="darkgreen") + coord_flip() + theme_minimal() + labs(title="Champion Global Importance")
+ggsave(file.path(output_dir, "Champion_Global_Importance.png"), p_champ_imp, width = 8, height = 6)
+
+# Detailed Plots
+options(warn=-1) # Suppress aes_string deprecation warnings temporarily
+for (feature in pruned_features) {
+  color_var <- if (feature == "Age") "Gender_num" else "Age"
+  p <- ggplot(interpretation_df, aes_string(x = feature, y = paste0("z_", feature), color = color_var)) +
+    geom_point(alpha = 0.3) + geom_smooth(method = "gam", color = "black") + theme_minimal() + labs(title = paste("Attention Weight:", feature))
+  if(feature == "Age") p <- p + facet_wrap(~Gender)
+  
+  file_name <- paste0("Champion_Attention_", feature, ".png")
+  ggsave(file.path(output_dir, file_name), p, width = 8, height = 6)
+}
+
+options(warn=0)
+cat("\n--- ALL PLOTS SAVED SUCCESSFULLY ---\n")
+```
